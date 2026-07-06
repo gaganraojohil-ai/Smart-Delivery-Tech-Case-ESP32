@@ -1,0 +1,39 @@
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+
+// ---------- TFT PIN CONFIGURATION ----------
+#define TFT_CS   27     // Chip select
+#define TFT_DC   26   // Data/Command
+#define TFT_RST  25    // Reset
+#define TFT_BL   4     // Backlight pin (optional)
+
+// ---------- TFT OBJECT ----------
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+
+void setup() {
+  // Initialize serial monitor (optional)
+  Serial.begin(115200);
+  Serial.println("TFT Test - Hello World");
+
+  // Initialize TFT
+  tft.initR(INITR_BLACKTAB);   // Try GREENTAB if display colors are off
+  tft.setRotation(1);          // 0-3, adjust for orientation
+  tft.fillScreen(ST77XX_BLACK);
+
+  // Turn on backlight (if connected to pin)
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+
+  // Display "HELLO WORLD"
+  tft.setTextSize(3);                 // Text size multiplier
+  tft.setTextColor(ST77XX_YELLOW);    // Text color
+  tft.setCursor(15, 60);              // (x, y) position
+  tft.print("ms");
+  tft.setCursor(15, 100);
+  tft.print("pal");
+}
+
+void loop() {
+  // Nothing here — static display
+}

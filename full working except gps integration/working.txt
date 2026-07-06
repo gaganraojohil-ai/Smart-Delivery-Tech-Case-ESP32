@@ -1,0 +1,313 @@
+#include <Keypad.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <Adafruit_Fingerprint.h>
+#include <HardwareSerial.h>
+#include <ESP32Servo.h>
+
+// ---------- TFT PIN CONFIGURATION ----------
+#define TFT_CS   5
+#define TFT_DC   16
+#define TFT_RST  17
+#define TFT_BL   4
+
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+
+// ---------- KEYPAD CONFIGURATION ----------
+const byte ROWS = 4;
+const byte COLS = 4;
+
+char keys[ROWS][COLS] = {
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
+};
+
+byte rowPins[ROWS] = {33, 25, 26, 27};
+byte colPins[COLS] = {14, 12, 13, 32};
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// ---------- SERVO ----------
+Servo servo1;  // main lock servo
+Servo servo2;  // secondary servo
+#define SERVO1_PIN 15
+#define SERVO2_PIN 2
+
+// ---------- FINGERPRINT ----------
+HardwareSerial mySerial(2);
+#define RX_PIN 21
+#define TX_PIN 22
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
+
+// ---------- VIBRATION SENSOR ----------
+#define VIB_PIN 19
+bool vibPrevState = LOW;
+
+// ---------- BUZZER ----------
+#define BUZZER_PIN 0
+
+// ---------- VARIABLES ----------
+String inputCode = "";
+String correctCode = "9289";
+bool codeVerified = false;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ESP32 - Fingerprint + Keypad + TFT + Servo + Vibration");
+
+  // TFT init
+  tft.initR(INITR_BLACKTAB);
+  tft.setRotation(1);
+  tft.fillScreen(ST77XX_BLACK);
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+
+  displayMessage("System Ready", "Place your finger or");
+  tft.setCursor(10, 40);
+  tft.println("enter passcode");
+
+  // Servo setup
+  servo1.attach(SERVO1_PIN);
+  servo2.attach(SERVO2_PIN);
+  servo1.write(180);  // closed
+  servo2.write(0);    // initial
+
+  // Fingerprint setup
+  mySerial.begin(57600, SERIAL_8N1, RX_PIN, TX_PIN);
+  finger.begin(57600);
+  if (finger.verifyPassword()) {
+    Serial.println("Fingerprint sensor detected!");
+  } else {
+    Serial.println("Fingerprint sensor not found!");
+    displayMessage("Error", "No Fingerprint");
+    while (1);
+  }
+
+  // Buzzer + vibration setup
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(VIB_PIN, INPUT);
+
+  delay(2000);
+  displayMessage(" Place your     finger", "     or         enter       passcode");
+}
+
+// ---------- BUZZER SOUND PATTERNS ----------
+void buzzerBeep(int pattern) {
+  switch (pattern) {
+    case 1: tone(BUZZER_PIN, 2000, 100); delay(100); noTone(BUZZER_PIN); break;          // short beep
+    case 2: tone(BUZZER_PIN, 1000, 500); delay(500); noTone(BUZZER_PIN); break;          // long beep
+    case 3: for (int i = 0; i < 2; i++) { tone(BUZZER_PIN, 2500, 100); delay(200); noTone(BUZZER_PIN); } break; // motion
+    case 4: tone(BUZZER_PIN, 1500, 150); delay(150); noTone(BUZZER_PIN); break;          // servo move
+    case 5: for (int i = 0; i < 3; i++) { tone(BUZZER_PIN, 800, 100); delay(150); noTone(BUZZER_PIN); } break;  // denied
+  }
+}
+
+// ---------- MAIN LOOP ----------
+void loop() {
+  // ---------- VIBRATION SENSOR ----------
+  int vibState = digitalRead(VIB_PIN);
+  if (vibState == HIGH && vibPrevState == LOW) {
+    Serial.println("Motion Detected!");
+    buzzerBeep(3);
+    displayMessage("Motion", "Detected!");
+    delay(1500);
+    displayMessage(" Place your     finger", "     or         enter       passcode");
+  }
+  vibPrevState = vibState;
+
+  // ---------- KEYPAD INPUT ----------
+  char key = keypad.getKey();
+  if (key) {
+    buzzerBeep(1);
+    Serial.print("Key pressed: ");
+    Serial.println(key);
+
+    if (key == 'A') {
+      enrollMode();
+      displayMessage(" Place your     finger", "     or         enter       passcode");
+    }
+    else if (key == '#') {
+      if (inputCode == correctCode) {
+        codeVerified = true;
+        displayMessage("Code", "Correct");
+        Serial.println("Code correct!");
+        buzzerBeep(1);
+        openDoor();
+      } else {
+        codeVerified = false;
+        displayMessage("Code", "Incorrect");
+        buzzerBeep(5);
+      }
+      inputCode = "";
+      delay(1500);
+      displayMessage(" Place your     finger", "     or         enter       passcode");
+    }
+    else if (key == 'C') {
+      Serial.println("Closing door...");
+      displayMessage("Closing", "Door...");
+
+      // Step 1: Servo1 (pin G15) from 90 → 180 (close position)
+      for (int angle = 90; angle <= 180; angle += 5) {
+        servo1.write(angle);
+        delay(15);
+      }
+      buzzerBeep(4);
+
+      delay(2000);  // Wait 2 seconds
+
+      // Step 2: Servo2 (pin G2) from 180 → 0
+      for (int angle = 180; angle >= 0; angle -= 5) {
+        servo2.write(angle);
+        delay(15);
+      }
+      buzzerBeep(4);
+
+      displayMessage("Door Closed", "");
+      delay(1500);
+      displayMessage(" Place your     finger", "     or         enter       passcode");
+    }
+    else if (key == 'B') {  // backspace key
+      if (inputCode.length() > 0) {
+        inputCode.remove(inputCode.length() - 1);
+        updateDisplayInput(inputCode);
+      }
+    }
+    else {
+      inputCode += key;
+      updateDisplayInput(inputCode);
+    }
+  }
+
+  // ---------- FINGERPRINT SCAN ----------
+  int p = finger.getImage();
+  if (p == FINGERPRINT_OK) {
+    p = finger.image2Tz();
+    if (p == FINGERPRINT_OK) {
+      p = finger.fingerFastSearch();
+      if (p == FINGERPRINT_OK) {
+        displayMessage("Access", "Granted");
+        buzzerBeep(2);
+        openDoor();
+        delay(1500);
+        displayMessage(" Place your     finger", "     or         enter       passcode");
+      } else if (p == FINGERPRINT_NOTFOUND) {
+        displayMessage("Access", "Denied");
+        buzzerBeep(5);
+        Serial.println("Fingerprint not recognized!");
+        delay(1500);
+        displayMessage(" Place your     finger", "     or         enter       passcode");
+      }
+    } else {
+      displayMessage("Error", "Try Again");
+      delay(1000);
+      displayMessage(" Place your     finger", "     or         enter       passcode");
+    }
+  } else if (p != FINGERPRINT_NOFINGER) {
+    displayMessage("Error", "Try Again");
+    delay(1000);
+    displayMessage(" Place your     finger", "     or         enter       passcode");
+  }
+}
+
+// ---------- DISPLAY FUNCTIONS ----------
+void displayMessage(String line1, String line2) {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(10, 10);
+  tft.println(line1);
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor(10, 40);
+  tft.println(line2);
+}
+
+void updateDisplayInput(String input) {
+  tft.fillRect(0, 60, tft.width(), 40, ST77XX_BLACK);
+  tft.setCursor(10, 60);
+  tft.setTextSize(3);
+  tft.setTextColor(ST77XX_GREEN);
+  tft.print(input);
+}
+
+// ---------- ENROLL MODE ----------
+void enrollMode() {
+  displayMessage("Enroll Mode", "Enter ID#");
+  String idStr = "";
+  while (true) {
+    char k = keypad.getKey();
+    if (k >= '0' && k <= '9') {
+      idStr += k;
+      updateDisplayInput(idStr);
+    } else if (k == '#') break;
+  }
+
+  int id = idStr.toInt();
+  if (id <= 0 || id > 100) {
+    displayMessage("Invalid ID", "Use 1-100");
+    delay(1500);
+    return;
+  }
+  enrollFingerprint(id);
+}
+
+// ---------- ENROLL FINGERPRINT ----------
+void enrollFingerprint(int id) {
+  int p = -1;
+  displayMessage("Place Finger", "");
+  while (p != FINGERPRINT_OK) {
+    p = finger.getImage();
+    if (p == FINGERPRINT_NOFINGER) continue;
+    if (p == FINGERPRINT_OK) displayMessage("Image", "Taken");
+  }
+  p = finger.image2Tz(1);
+  if (p != FINGERPRINT_OK) { displayMessage("Error", "1st Scan"); return; }
+
+  displayMessage("Remove Finger", "");
+  delay(2000);
+  while (finger.getImage() != FINGERPRINT_NOFINGER);
+
+  displayMessage("Place Again", "");
+  p = -1;
+  while (p != FINGERPRINT_OK) {
+    p = finger.getImage();
+    if (p == FINGERPRINT_NOFINGER) continue;
+  }
+  p = finger.image2Tz(2);
+  if (p != FINGERPRINT_OK) { displayMessage("Error", "2nd Scan"); return; }
+
+  p = finger.createModel();
+  if (p == FINGERPRINT_OK) displayMessage("Model", "Created");
+  else { displayMessage("Model", "Failed"); return; }
+
+  p = finger.storeModel(id);
+  if (p == FINGERPRINT_OK) displayMessage("Enroll Done", "ID " + String(id));
+  else displayMessage("Store Failed", "");
+
+  delay(2000);
+}
+
+// ---------- SERVO MOVEMENT ----------
+void openDoor() {
+  // Step 1: Servo2 (pin G2) from 0 → 180
+  for (int angle = 0; angle <= 180; angle += 5) {
+    servo2.write(angle);
+    delay(15);
+  }
+  buzzerBeep(4);
+
+  delay(2000);
+
+  // Step 2: Servo1 (pin G15) from 180 → 90 (open position)
+  for (int angle = 180; angle >= 90; angle -= 5) {
+    servo1.write(angle);
+    delay(15);
+  }
+  buzzerBeep(4);
+
+  Serial.println("Door opened - waiting for C to close.");
+  displayMessage("Door Opened", "Press C to close");
+  buzzerBeep(4);
+}

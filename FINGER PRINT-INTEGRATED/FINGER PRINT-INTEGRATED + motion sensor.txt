@@ -1,0 +1,346 @@
+#include <Keypad.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <Adafruit_Fingerprint.h>
+#include <ESP32Servo.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <TinyGPSPlus.h>
+#include <SPIFFS.h>
+#include <time.h>
+#include <WiFiClientSecure.h>
+#include <vector>
+
+// ===================== ACCESS CONTROL CONFIG =====================
+
+// TFT pins
+#define TFT_CS   5
+#define TFT_DC   16
+#define TFT_RST  17
+#define TFT_BL   4
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+
+// Keypad
+const byte ROWS = 4;
+const byte COLS = 4;
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+byte rowPins[ROWS] = {33,25,26,27};
+byte colPins[COLS] = {14,12,13,32};
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// Servo
+Servo servo;
+#define SERVO_PIN 15
+
+// Fingerprint
+HardwareSerial fingerSerial(2);
+#define RX_PIN 21
+#define TX_PIN 22
+Adafruit_Fingerprint finger(&fingerSerial);
+
+// Vibration sensor
+#define VIB_PIN 19
+bool vibPrevState = LOW;
+
+// Access control variables
+String inputCode = "";
+String correctCode = "9289";
+bool codeVerified = false;
+
+// ===================== GPS CONFIG =====================
+
+const char* WIFI_SSID = "12345678";
+const char* WIFI_PASS = "12345678";
+const char* GEO_BASE_HTTPS = "https://www.circuitdigest.cloud/geolinker";
+const char* GEO_BASE_HTTP  = "http://www.circuitdigest.cloud/geolinker"; 
+const char* API_KEY = "eNWl8tqHQVkA";            
+const char* DEVICE_ID = "testdevice";            
+
+const int GPS_RX = 34; 
+const int GPS_TX = 35;
+const uint32_t GPS_BAUD = 9600;
+const uint32_t SEND_INTERVAL_MS = 5000;  
+const size_t OFFLINE_BUFFER_LIMIT = 100;
+const char* OFFLINE_FILE = "/offline.txt";
+
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1); // Serial1 for GPS
+unsigned long lastSendMs = 0;
+
+// ===================== TIMEZONE =====================
+const int8_t TZ_HOURS = 5;
+const int8_t TZ_MINUTES = 30;
+
+// ===================== SETUP =====================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("System Starting...");
+
+  // TFT
+  tft.initR(INITR_BLACKTAB);
+  tft.setRotation(1);
+  tft.fillScreen(ST77XX_BLACK);
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+  displayMessage("System Ready","Place finger or code");
+
+  // Servo
+  servo.attach(SERVO_PIN);
+  servo.write(0);
+
+  // Fingerprint
+  fingerSerial.begin(57600, SERIAL_8N1, RX_PIN, TX_PIN);
+  finger.begin(57600);
+  if(finger.verifyPassword()) Serial.println("Fingerprint detected");
+  else { Serial.println("Fingerprint not found"); while(1); }
+
+  // Vibration sensor
+  pinMode(VIB_PIN, INPUT);
+
+  // GPS init
+  if(!SPIFFS.begin(true)) Serial.println("SPIFFS init failed");
+  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  // WiFi
+  WiFi.begin(WIFI_SSID,WIFI_PASS);
+  unsigned long start = millis();
+  while(millis()-start<15000 && WiFi.status()!=WL_CONNECTED){ delay(500); Serial.print("."); }
+  if(WiFi.status()==WL_CONNECTED) { Serial.println("WiFi connected"); initNTP(); flushOfflineToServer(); }
+  else Serial.println("WiFi not connected");
+}
+
+// ===================== LOOP =====================
+void loop() {
+  // ---------- VIBRATION SENSOR ----------
+  int vibState = digitalRead(VIB_PIN);
+  if(vibState==HIGH && vibPrevState==LOW){
+    Serial.println("Motion Detected!");
+    displayMessage("Motion","Detected!");
+    delay(1500);
+    displayMessage("Place finger or code","");
+  }
+  vibPrevState = vibState;
+
+  // ---------- KEYPAD ----------
+  char key = keypad.getKey();
+  if(key) handleKey(key);
+
+  // ---------- FINGERPRINT ----------
+  handleFingerprint();
+
+  // ---------- GPS ----------
+  while(gpsSerial.available()>0){
+    char c = gpsSerial.read();
+    gps.encode(c);
+  }
+  if(gps.location.isUpdated() && millis()-lastSendMs>=SEND_INTERVAL_MS){
+    lastSendMs = millis();
+    if(gps.location.isValid()){
+      double lat = gps.location.lat();
+      double lon = gps.location.lng();
+      Serial.printf("GPS: %f, %f\n",lat,lon);
+      queueOrSend(lat,lon);
+    } else Serial.println("GPS location not valid yet.");
+  }
+
+  // WiFi auto reconnect
+  static unsigned long lastConnectAttempt = 0;
+  if(WiFi.status() != WL_CONNECTED && millis()-lastConnectAttempt>15000){
+    lastConnectAttempt = millis();
+    Serial.println("Attempting WiFi reconnect...");
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    unsigned long tstart = millis();
+    while(millis()-tstart<8000 && WiFi.status()!=WL_CONNECTED) delay(200);
+    if(WiFi.status()==WL_CONNECTED){
+      Serial.println("WiFi reconnected."); initNTP(); flushOfflineToServer();
+    } else Serial.println("WiFi reconnect failed.");
+  }
+
+  delay(100); // small delay for stability
+}
+
+// ===================== DISPLAY FUNCTIONS =====================
+void displayMessage(String l1,String l2){
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(10,10); tft.println(l1);
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor(10,40); tft.println(l2);
+}
+
+void updateDisplayInput(String input){
+  tft.fillRect(0,60,tft.width(),40,ST77XX_BLACK);
+  tft.setCursor(10,60); tft.setTextSize(3); tft.setTextColor(ST77XX_GREEN); tft.print(input);
+}
+
+// ===================== ACCESS CONTROL FUNCTIONS =====================
+void handleKey(char key){
+  Serial.print("Key: "); Serial.println(key);
+  if(key=='A'){ enrollMode(); displayMessage("Place finger or code",""); }
+  else if(key=='#'){
+    if(inputCode==correctCode){ codeVerified=true; displayMessage("Code","Correct"); Serial.println("Code correct"); openDoor(); }
+    else{ codeVerified=false; displayMessage("Code","Incorrect"); }
+    inputCode=""; delay(1500); displayMessage("Place finger or code","");
+  }
+  else if(key=='*'){ inputCode=""; displayMessage("Cleared",""); delay(800); displayMessage("Place finger or code",""); }
+  else{ inputCode+=key; updateDisplayInput(inputCode); }
+}
+
+void handleFingerprint(){
+  int p = finger.getImage();
+  if(p==FINGERPRINT_OK){ p=finger.image2Tz();
+    if(p==FINGERPRINT_OK){ p=finger.fingerFastSearch();
+      if(p==FINGERPRINT_OK){ displayMessage("Access","Granted"); openDoor(); delay(1500); displayMessage("Place finger or code",""); }
+      else if(p==FINGERPRINT_NOTFOUND){ displayMessage("Access","Denied"); Serial.println("Fingerprint not recognized"); delay(1500); displayMessage("Place finger or code",""); }
+    } else{ displayMessage("Error","Try Again"); delay(1000); displayMessage("Place finger or code",""); }
+  } else if(p!=FINGERPRINT_NOFINGER){ displayMessage("Error","Try Again"); delay(1000); displayMessage("Place finger or code",""); }
+}
+
+void openDoor(){
+  for(int angle=0;angle<=180;angle+=5){ servo.write(angle); delay(15); }
+  delay(2000);
+  for(int angle=180;angle>=0;angle-=5){ servo.write(angle); delay(15); }
+}
+
+void enrollMode(){
+  displayMessage("Enroll Mode","Enter ID#");
+  String idStr="";
+  while(true){
+    char k = keypad.getKey();
+    if(k>='0' && k<='9'){ idStr+=k; updateDisplayInput(idStr); }
+    else if(k=='#') break;
+  }
+  int id = idStr.toInt();
+  if(id<=0 || id>100){ displayMessage("Invalid ID","Use 1-100"); delay(1500); return; }
+  enrollFingerprint(id);
+}
+
+void enrollFingerprint(int id){
+  int p=-1;
+  displayMessage("Place Finger","");
+  while(p!=FINGERPRINT_OK){
+    p=finger.getImage(); 
+    if(p==FINGERPRINT_NOFINGER) continue;
+    if(p==FINGERPRINT_OK) displayMessage("Image","Taken");
+  }
+  p=finger.image2Tz(1);
+  if(p!=FINGERPRINT_OK){ displayMessage("Error","1st Scan"); return; }
+  displayMessage("Remove Finger","");
+  delay(2000);
+  while(finger.getImage()!=FINGERPRINT_NOFINGER);
+  displayMessage("Place Again","");
+  p=-1;
+  while(p!=FINGERPRINT_OK){
+    p=finger.getImage();
+    if(p==FINGERPRINT_NOFINGER) continue;
+  }
+  p=finger.image2Tz(2);
+  if(p!=FINGERPRINT_OK){ displayMessage("Error","2nd Scan"); return; }
+  p=finger.createModel();
+  if(p==FINGERPRINT_OK) displayMessage("Model","Created");
+  else{ displayMessage("Model","Failed"); return; }
+  p=finger.storeModel(id);
+  if(p==FINGERPRINT_OK) displayMessage("Enroll Done","ID "+String(id));
+  else displayMessage("Store Failed","");
+  delay(2000);
+}
+
+// ===================== GPS FUNCTIONS =====================
+bool initNTP(){
+  long gmtOffset_sec = (long)TZ_HOURS*3600+(long)TZ_MINUTES*60;
+  const long daylightOffset_sec = 0;
+  configTime(gmtOffset_sec,daylightOffset_sec,"pool.ntp.org","time.google.com");
+  for(int i=0;i<8;i++){
+    struct tm timeinfo;
+    if(getLocalTime(&timeinfo)) return true;
+    delay(500);
+  }
+  return false;
+}
+
+String getTimestampString(){
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)) return String("1970-01-01 00:00:00");
+  char buf[32];
+  strftime(buf,sizeof(buf),"%Y-%m-%d %H:%M:%S",&timeinfo);
+  return String(buf);
+}
+
+bool appendOffline(const String &jsonLine){
+  File f = SPIFFS.open(OFFLINE_FILE, FILE_APPEND);
+  if(!f){ Serial.println("Failed open offline file"); return false; }
+  f.println(jsonLine); f.close(); Serial.println("Buffered offline payload"); return true;
+}
+
+bool postToGeoLinkerHTTPS(const String &payload,String &respBody,int &respCode){
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http; http.setTimeout(15000);
+  if(!http.begin(client,GEO_BASE_HTTPS)){ Serial.println("[HTTP] begin failed (HTTPS)"); return false; }
+  http.addHeader("Content-Type","application/json"); http.addHeader("Authorization",API_KEY);
+  respCode = http.POST(payload); respBody = (respCode>0)? http.getString():""; http.end();
+  return (respCode>0);
+}
+
+bool postToGeoLinkerHTTP(const String &payload,String &respBody,int &respCode){
+  WiFiClient client;
+  HTTPClient http; http.setTimeout(15000);
+  if(!http.begin(client,GEO_BASE_HTTP)){ Serial.println("[HTTP] begin failed (HTTP)"); return false; }
+  http.addHeader("Content-Type","application/json"); http.addHeader("Authorization",API_KEY);
+  respCode = http.POST(payload); respBody=(respCode>0)? http.getString():""; http.end();
+  return (respCode>0);
+}
+
+bool sendPayloadToServer(const String &payload){
+  String resp; int code=-999;
+  Serial.println("Posting to GeoLinker (HTTPS)...");
+  if(postToGeoLinkerHTTPS(payload,resp,code)){
+    Serial.printf("HTTPS respCode=%d\n",code); Serial.println("Body: "+resp);
+    if(code==200||code==201) return true;
+    if(code>=400 && code<500) return false;
+  } else Serial.println("HTTPS attempt failed, fallback HTTP...");
+  resp=""; code=-999;
+  if(postToGeoLinkerHTTP(payload,resp,code)){
+    Serial.printf("HTTP respCode=%d\n",code); Serial.println("Body: "+resp);
+    if(code==200||code==201) return true;
+    if(code>=400 && code<500) return false;
+  } else Serial.println("HTTP attempt failed");
+  return false;
+}
+
+void queueOrSend(double lat,double lon){
+  String timestamp = getTimestampString();
+  String payload = String("{\"device_id\":\"")+DEVICE_ID+"\",\"timestamp\":[\""+timestamp+"\"],\"lat\":["+String(lat,6)+"],\"long\":["+String(lon,6)+"]}";
+  Serial.println("Prepared payload: "+payload);
+  if(WiFi.status()==WL_CONNECTED){
+    bool ok=sendPayloadToServer(payload);
+    if(ok){ Serial.println("✓ payload accepted by GeoLinker"); flushOfflineToServer(); return; }
+    else appendOffline(payload);
+  } else appendOffline(payload);
+}
+
+bool flushOfflineToServer(){
+  if(WiFi.status()!=WL_CONNECTED){ Serial.println("Cannot flush offline: WiFi disconnected"); return false; }
+  if(!SPIFFS.exists(OFFLINE_FILE)) return true;
+  File f=SPIFFS.open(OFFLINE_FILE, FILE_READ); if(!f){ Serial.println("Failed to open offline file"); return false; }
+  std::vector<String> leftover;
+  while(f.available()){
+    String line=f.readStringUntil('\n'); line.trim(); if(line.length()==0) continue;
+    Serial.println("Attempting flush payload: "+line);
+    if(!sendPayloadToServer(line)) leftover.push_back(line);
+    else Serial.println("Flushed offline payload");
+  }
+  f.close();
+  if(leftover.size()==0){ SPIFFS.remove(OFFLINE_FILE); Serial.println("Offline buffer emptied."); return true; }
+  File fw=SPIFFS.open(OFFLINE_FILE, FILE_WRITE); if(!fw){ Serial.println("Failed rewrite offline file"); return false; }
+  for(auto &s:leftover) fw.println(s); fw.close();
+  Serial.printf("Offline buffer left: %u entries\n",(unsigned)leftover.size());
+  return false;
+}

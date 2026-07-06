@@ -1,0 +1,169 @@
+// Required Libraries for ESP8266 Wi-Fi and Web Server
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+// Required Library for Servo Motor Control
+#include <Servo.h>
+
+// --- Wi-Fi Configuration ---
+// IMPORTANT: Replace with your actual Wi-Fi credentials
+const char* ssid = "12345678";
+const char* password = "12345678";
+
+// --- Server & Security Configuration ---
+// The ESP8266 IP address will be displayed in the Serial Monitor.
+// Ensure your Android phone is on the same local network.
+const int SERVER_PORT = 80;
+// This must match the token used in your Android app's URL: "my_secret_token"
+const String SECRET_TOKEN = "my_secret_token"; 
+
+// --- Hardware Configuration ---
+// D4 pin on NodeMCU/Wemos D1 Mini boards maps to GPIO 2 (D4 is the correct label)
+const int SERVO_PIN = 2; // D4 is GPIO 2
+
+// --- Object Initialization ---
+ESP8266WebServer server(SERVER_PORT);
+Servo servoMotor;
+
+// Define the two positions for the servo
+const int LOCKED_POSITION = 0;   // Locked position (0 degrees)
+const int UNLOCKED_POSITION = 90; // Unlocked position (90 degrees)
+
+// --- Function Prototypes ---
+void handleRoot();
+void handleUnlock();
+void handleNotFound();
+void servoUnlockAction();
+
+
+// ===================================
+// SETUP
+// ===================================
+void setup() {
+    Serial.begin(115200);
+    delay(10);
+    Serial.println("\n");
+
+    // 1. Attach the servo object to the designated pin
+    servoMotor.attach(SERVO_PIN);
+    servoMotor.write(LOCKED_POSITION); // Ensure it starts in the locked position
+
+    // 2. Connect to Wi-Fi
+    Serial.print("Connecting to ");
+    Serial.println(ssid);
+
+    WiFi.begin(ssid, password);
+
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+
+    Serial.println("\nWiFi connected.");
+    Serial.print("Local IP address: ");
+    Serial.println(WiFi.localIP());
+
+    // 3. Define Server Routes
+    // Handle the specific unlock request from the Android app
+    server.on("/unlock", HTTP_GET, handleUnlock); 
+
+    // Handle the root path for testing
+    server.on("/", HTTP_GET, handleRoot);
+
+    // Handle any requests that don't match the defined routes
+    server.onNotFound(handleNotFound);
+
+    // 4. Start the server
+    server.begin();
+    Serial.println("HTTP server started.");
+}
+
+
+// ===================================
+// LOOP (Main Execution)
+// ===================================
+void loop() {
+    // Continuously handle incoming client requests
+    server.handleClient();
+}
+
+
+// ===================================
+// HANDLERS
+// ===================================
+
+/**
+ * Handles the specific /unlock endpoint request from the Android app.
+ * This is the core logic for checking the token.
+ */
+void handleUnlock() {
+    // Check if the 'token' argument exists in the URL
+    if (server.hasArg("token")) {
+        // Get the value of the 'token' argument
+        String receivedToken = server.arg("token");
+        
+        Serial.print("Received unlock attempt with token: ");
+        Serial.println(receivedToken);
+
+        // Validate the received token against the secret
+        if (receivedToken == SECRET_TOKEN) {
+            Serial.println("Token correct! Actuating servo.");
+            
+            // 1. Perform the servo movement
+            servoUnlockAction();
+
+            // 2. Send success response back to the Android app
+            server.send(200, "text/plain", "SUCCESS: Door unlocked by authenticated user.");
+        } else {
+            Serial.println("Token incorrect! Access denied.");
+            // Send 403 Forbidden error response
+            server.send(403, "text/plain", "ERROR: Invalid token received. Access Forbidden.");
+        }
+    } else {
+        Serial.println("No token provided in /unlock request.");
+        // Send 400 Bad Request if the token parameter is missing
+        server.send(400, "text/plain", "ERROR: Token parameter is missing.");
+    }
+}
+
+/**
+ * Moves the servo to the unlocked position, holds it, and moves it back to locked.
+ */
+void servoUnlockAction() {
+    // Move to Unlocked Position
+    servoMotor.write(UNLOCKED_POSITION);
+    Serial.print("Servo moved to ");
+    Serial.println(UNLOCKED_POSITION);
+    
+    // Hold the unlocked position for 3 seconds
+    delay(3000); 
+
+    // Move back to Locked Position
+    servoMotor.write(LOCKED_POSITION);
+    Serial.print("Servo moved to ");
+    Serial.println(LOCKED_POSITION);
+}
+
+
+/**
+ * Simple handler for the root path (/)
+ */
+void handleRoot() {
+    String html = "<html><body>";
+    html += "<h1>ESP8266 Servo Lock Server</h1>";
+    html += "<p>Server is running. Send GET request to /unlock?token=my_secret_token</p>";
+    html += "<p>Current State: Locked (0 degrees)</p>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+}
+
+/**
+ * Handles all other undefined paths
+ */
+void handleNotFound() {
+    String message = "File Not Found\n\n";
+    message += "URI: ";
+    message += server.uri();
+    message += "\nMethod: ";
+    message += (server.method() == HTTP_GET) ? "GET" : "POST";
+    server.send(404, "text/plain", message);
+}
